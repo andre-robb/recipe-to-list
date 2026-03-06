@@ -140,7 +140,6 @@
       background: var(--color-blue);
       color: var(--color-white);
       width: 100%;
-      margin-top: var(--space-3);
     }
 
     .btn--primary:hover { background: var(--color-blue-dark); }
@@ -158,6 +157,19 @@
     }
 
     .btn--copy:hover { background: var(--color-blue-dark); }
+
+    .btn--clear {
+      background: var(--color-gray-100);
+      color: var(--color-gray-600);
+      border: 1.5px solid var(--color-gray-200);
+    }
+
+    .btn--clear:hover { background: var(--color-gray-200); }
+    .btn--clear:disabled {
+      color: var(--color-gray-400);
+      cursor: not-allowed;
+      transform: none;
+    }
 
     .btn--copy.is-copied {
       background: var(--color-green);
@@ -324,9 +336,14 @@
         placeholder="2 cups all-purpose flour&#10;1 tsp kosher salt&#10;3 cloves garlic, minced&#10;..."
         aria-label="Paste recipe ingredients here"
       ></textarea>
-      <button class="btn btn--primary" id="parse-btn" disabled>
-        Parse ingredients
-      </button>
+      <div style="display:flex; gap:var(--space-2); margin-top:var(--space-3);">
+        <button class="btn btn--primary" id="parse-btn" disabled style="flex:1;">
+          Parse ingredients
+        </button>
+        <button class="btn btn--clear" id="clear-btn" disabled>
+          Clear
+        </button>
+      </div>
     </div>
 
     <!-- Output card -->
@@ -388,18 +405,44 @@
       'i'
     );
 
-    // Matches section headers like "For the Sauce", "For the Noodles", or
-    // short all-title-case lines with no digits/fractions (e.g. "The Sauce", "Garnish")
+    // Matches section headers and known iOS export noise lines
     const HEADER_RE = /^for\s+the\b/i;
-    const SHORT_TITLE_RE = /^(?:[A-Z][a-z]*\s*){1,4}$/;
+    const NOISE_RE = /^(your grocery list|\d+\s+recipes?|\d[\d\s\w]*servings?)$/i;
 
     // ─── Parse ───────────────────────────────────────────────────────
     function parseIngredients(raw) {
-      return raw
-        .split('\n')
-        .map(line => line.trim())
+      const lines = raw.split('\n').map(line => line.trim());
+
+      // Truncate at "View Recipes on NYT Cooking" footer
+      const footerIdx = lines.findIndex(l => /^view recipes on/i.test(l));
+      const clipped = footerIdx !== -1 ? lines.slice(0, footerIdx) : lines;
+
+      // If this looks like an iOS NYT export (starts with "Your Grocery List"),
+      // skip everything up to and including the first dash divider — that removes
+      // the header block (title, recipe count, recipe names, servings lines)
+      let start = 0;
+      if (/^your grocery list$/i.test(clipped[0])) {
+        const firstDash = clipped.findIndex(l => /^[-–—]+$/.test(l));
+        start = firstDash !== -1 ? firstDash + 1 : 0;
+      }
+      const trimmed = clipped.slice(start);
+
+      // Build a set of line indices to drop:
+      // any non-empty line that is immediately followed by a servings line
+      // is a recipe title (e.g. "One-Pot Chicken Meatballs With Greens" → "4 servings")
+      const nonEmpty = trimmed.filter(l => l.length > 0);
+      const titleIndices = new Set();
+      for (let i = 0; i < nonEmpty.length - 1; i++) {
+        if (NOISE_RE.test(nonEmpty[i + 1])) {
+          titleIndices.add(nonEmpty[i]);
+        }
+      }
+
+      return trimmed
         .filter(line => line.length > 0)
-        .filter(line => !HEADER_RE.test(line) && !SHORT_TITLE_RE.test(line))
+        .filter(line => !/^[-–—]+$/.test(line))           // remove dash-only dividers
+        .filter(line => !HEADER_RE.test(line) && !NOISE_RE.test(line))
+        .filter(line => !titleIndices.has(line))           // remove recipe titles
         .map(stripQuantity)
         .filter(line => line.length > 0);
     }
@@ -411,8 +454,13 @@
       result = result.replace(BARE_UNIT_RE, '');
       // Remove parenthetical quantities like "(100g)" or "(2 oz)"
       result = result.replace(/\(\s*[\d½¼¾]+\s*(?:g|oz|ml|kg|lb)?\s*\)/gi, '');
-      // Strip prep notes after comma: "garlic, minced" → "garlic"
-      result = result.replace(/,.*$/, '');
+      // Strip prep notes after comma, but keep options lists (those containing "or")
+      // e.g. "garlic, minced" → "garlic"  |  "sunflower, safflower or canola oil" → kept
+      result = result.replace(/,(.*)$/, (_, after) => {
+        return /\bor\b/i.test(after) ? ',' + after : '';
+      });
+      // Strip trailing serving/usage notes: ", for serving", ", for topping", etc.
+      result = result.replace(/,\s*for\s+\w+.*$/i, '');
       // Capitalise first letter, trim
       result = result.trim();
       return result.charAt(0).toUpperCase() + result.slice(1);
@@ -424,13 +472,19 @@
       const count = document.getElementById('output-count');
       const output = document.getElementById('output');
 
-      list.innerHTML = ingredients
-        .map(ing => `
-          <li class="ingredient-list__item">
-            <span class="ingredient-list__bullet" aria-hidden="true"></span>
-            <span>${ing}</span>
-          </li>`)
-        .join('');
+      list.innerHTML = '';
+      ingredients.forEach(ing => {
+        const li = document.createElement('li');
+        li.className = 'ingredient-list__item';
+        const bullet = document.createElement('span');
+        bullet.className = 'ingredient-list__bullet';
+        bullet.setAttribute('aria-hidden', 'true');
+        const text = document.createElement('span');
+        text.textContent = ing;
+        li.appendChild(bullet);
+        li.appendChild(text);
+        list.appendChild(li);
+      });
 
       count.textContent = `${ingredients.length} ingredient${ingredients.length !== 1 ? 's' : ''}`;
       output.classList.add('is-visible');
@@ -457,11 +511,23 @@
 
     const input = document.getElementById('ingredients-input');
     const parseBtn = document.getElementById('parse-btn');
+    const clearBtn = document.getElementById('clear-btn');
     const copyBtn = document.getElementById('copy-btn');
 
-    // Enable parse button only when there's input
+    // Enable parse/clear buttons only when there's input
     input.addEventListener('input', () => {
-      parseBtn.disabled = input.value.trim().length === 0;
+      const hasContent = input.value.trim().length > 0;
+      parseBtn.disabled = !hasContent;
+      clearBtn.disabled = !hasContent;
+    });
+
+    clearBtn.addEventListener('click', () => {
+      input.value = '';
+      parseBtn.disabled = true;
+      clearBtn.disabled = true;
+      document.getElementById('output').classList.remove('is-visible');
+      parsedIngredients = [];
+      input.focus();
     });
 
     parseBtn.addEventListener('click', () => {
